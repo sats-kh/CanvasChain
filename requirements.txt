@@ -1,0 +1,7 @@
+diffusers
+controlnet_aux
+accelerate
+transformers
+torch
+gradio
+
