@@ -19,9 +19,11 @@ accelerator = Accelerator()
 import os 
 # 기본 설정
 negative_prompt = ""
-device = torch.device('cuda')  # controlnet 모델은 기본 cuda 사용 (예: cuda:0)
-num_images = 3
+device = torch.device('cuda:0')  # controlnet 모델은 기본 cuda 사용 (예: cuda:0)
+num_images = 6
 threshold = 250  # 사용하지 않는 변수면 삭제 가능
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # 모델 로드 (Sketch / ControlNet 모델)
 controlnet = ControlNetModel.from_pretrained(
@@ -39,46 +41,45 @@ pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.conf
 
 hed = HEDdetector.from_pretrained('lllyasviel/Annotators')
 
+device_img2img = torch.device('cuda:1')
 # 이미지-투-이미지 모델 로드 (cuda:1에서 동작)
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 model_id = "stabilityai/stable-diffusion-3.5-medium"
 nf4_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16
+    bnb_4bit_compute_dtype=torch.float16
 )
 
 # load img2img model
-device_img2img = torch.device("cuda:2")
 model_nf4 = SD3Transformer2DModel.from_pretrained(
     model_id,
     subfolder="transformer",
     quantization_config=nf4_config,
-    torch_dtype=torch.bfloat16
+    torch_dtype=torch.float16
 ).to(device_img2img)
 
 img2img_pipe = AutoPipelineForImage2Image.from_pretrained(
     model_id,
     transformer=model_nf4,
-    torch_dtype=torch.bfloat16,
-).to(device_img2img)
+    torch_dtype=torch.float16,
+).to(device)
 img2img_pipe = accelerator.prepare(img2img_pipe)
 img2img_pipe.enable_model_cpu_offload()
 img2img_pipe.safety_checker = None  # 필요에 따라 safety_checker 비활성화
 
 ## load inpaint2img model
-device_inpaint2img = torch.device("cuda:3")
+device_inpaint2img = torch.device("cuda:1")
 model_nf4 = SD3Transformer2DModel.from_pretrained(
     model_id,
     subfolder="transformer",
     quantization_config=nf4_config,
-    torch_dtype=torch.bfloat16
+    torch_dtype=torch.float16
 ).to(device_inpaint2img)
 
 inpaint2img_pipe = StableDiffusion3InpaintPipeline.from_pretrained(
     model_id,
     transformer=model_nf4,
-    torch_dtype=torch.bfloat16,
+    torch_dtype=torch.float16,
 ).to(device_inpaint2img)
 inpaint2img_pipe = accelerator.prepare(inpaint2img_pipe)
 inpaint2img_pipe.enable_model_cpu_offload()
@@ -176,7 +177,7 @@ def generate_img2img(selected_img, img2img_prompt, img2img_strength, img2img_gui
         strength=img2img_strength,
         guidance_scale=img2img_guidance,
         negative_prompt=img2img_negative_prompt,
-        num_inference_steps=28  # 필요에 따라 조정
+        num_inference_steps=30  # 필요에 따라 조정
     )
     return result.images[0]
 

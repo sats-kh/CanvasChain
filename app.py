@@ -1,166 +1,166 @@
 import gradio as gr
-import torch
-import numpy as np
-from PIL import Image
-from diffusers import StableDiffusionControlNetPipeline, ControlNetModel, EulerAncestralDiscreteScheduler
-from diffusers.utils import load_image
-from controlnet_aux import HEDdetector
+from model_functions import (
+    predict, run_sketching, generate_img2img,
+    generate_inpainted_image, reset
+)
 
-# Model and constant initialization (동일)
-negative_prompt = ""
-device = torch.device('cuda')
-num_images = 3
+# 기본 설정값
+num_images = 6
 
-controlnet = ControlNetModel.from_pretrained(
-    "vsanimator/sketch-a-sketch", 
-    torch_dtype=torch.float16
-).to(device)
+# --- Wrapper 함수 정의 ---
 
-pipe = StableDiffusionControlNetPipeline.from_pretrained(
-    "runwayml/stable-diffusion-v1-5", 
-    controlnet=controlnet, 
-    torch_dtype=torch.float16
-).to(device)
-pipe.safety_checker = None
-pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
-hed = HEDdetector.from_pretrained('lllyasviel/Annotators')  # ControlNet
+def run_sketching_with_version(prompt, negative_prompt, i_prev, sketch_states, checkbox_state, checkbox_remove_background, version_state):
+    # checkbox_remove_background는 True/False 값으로 전달됨
+    outputs = run_sketching(prompt, negative_prompt, i_prev, sketch_states, checkbox_state, checkbox_remove_background)
+    if i_prev is not None:
+        version_state.append((i_prev, f"Sketch Composite\nPrompt: {prompt}"))
+        return outputs + [version_state]
+    return outputs + [version_state]
 
-######################################
-# Functions
-######################################
+def generate_img2img_with_version(selected_image, prompt, strength, guidance, negative, version_state, checkbox_remove_background):
+    result = generate_img2img(selected_image, prompt, strength, guidance, negative, checkbox_remove_background)
+    if version_state is None:
+        version_state = []
+    version_state.append((selected_image, "Selected for Img2Img"))
+    version_state.append((result, f"Img2Img\nPrompt: {prompt}\nStrength: {strength}, Guidance: {guidance}"))
+    return result, version_state
 
-def sketch(curr_sketch, prev_sketch, prompt, negative_prompt, seed, num_steps=20):
-    """주어진 스케치를 기반으로 이미지를 생성"""
-    print("Sketching")
-    if curr_sketch is None:
-        curr_sketch = np.full((512, 512, 3), 255, dtype=np.uint8)
-    if prev_sketch is None:
-        prev_sketch = curr_sketch
-    generator = torch.Generator(device=device)
-    generator.manual_seed(seed)
-    
-    # curr_sketch는 gr.ImageEditor에서 전달된 경우 dict형태이므로 "composite" 키를 사용
-    if isinstance(curr_sketch, dict):
-        curr_sketch = curr_sketch.get("composite")
-    
-    curr_sketch_image = Image.fromarray(curr_sketch.astype(np.uint8)).convert("L")
-    
-    images = pipe(
-        prompt,
-        curr_sketch_image.convert("RGB").point(lambda p: 256 if p > 128 else 0),
-        negative_prompt=negative_prompt,
-        num_inference_steps=num_steps,
-        generator=generator,
-        controlnet_conditioning_scale=1.0
-    ).images
-    
-    return images[0]
-def run_sketching(prompt, curr_sketch, prev_sketch, sketch_states, shadow_draw):
-    """여러 이미지를 생성하고 스케치 상태를 관리 (gr.ImageEditor 사용)"""
-    # gr.ImageEditor로부터 전달된 값은 dict 형태일 수 있으므로, composite 이미지를 추출
-    if curr_sketch is not None and isinstance(curr_sketch, dict):
-        curr_sketch_np = curr_sketch.get("composite")
-    else:
-        curr_sketch_np = curr_sketch
+def generate_inpainted_image_with_version(inpaint_img, prompt, negative, strength, guidance, version_state, checkbox_remove_background):
+    result = generate_inpainted_image(inpaint_img, prompt, negative, strength, guidance, checkbox_remove_background)
+    if version_state is None:
+        version_state = []
+    version_state.append((result, f"Inpainting\nPrompt: {prompt}\nStrength: {strength}, Guidance: {guidance}"))
+    return result, version_state
 
-    to_return = []
-    for k in range(num_images):
-        seed = sketch_states[k][1]
-        if seed is None:
-            seed = np.random.randint(1000)
-            sketch_states[k][1] = seed
-        new_image = sketch(
-            curr_sketch_np, prev_sketch, prompt,
-            negative_prompt, seed=seed, num_steps=20
-        )
-        to_return.append(new_image)
+def select_image(image):
+    if isinstance(image, (list, tuple)):
+        return image[0]
+    return image
 
-    if curr_sketch_np is None:
-        curr_sketch_np = np.full((512, 512, 3), 255, dtype=np.uint8)
-    prev_sketch = curr_sketch_np
+def select_image_and_record_switch_with_prompts(image, version_state, prompt, negative_prompt,):
+    selected = select_image(image)
+    if version_state is None:
+        version_state = []
+    # 선택한 이미지, sketch 탭의 prompt, negative prompt, 그리고 탭 업데이트 명령을 반환
+    return selected, version_state, prompt, negative_prompt, gr.update(selected=1)
 
-    if shadow_draw:
-        hed_images = []
-        for image in to_return:
-            # hed()로 반환된 이미지를 PIL 이미지로 변환, RGB로 변환 후 (512,512)로 리사이즈
-            hed_image = hed(image, scribble=False)
-            pil_hed = Image.fromarray(np.uint8(hed_image)).convert("RGB").resize((512,512))
-            hed_images.append(np.array(pil_hed).astype(float))
-        # 여러 hed 이미지를 평균내어 하나의 이미지 생성
-        avg_hed_resized = np.mean(hed_images, axis=0)
-        # 혹시 avg_hed_resized의 크기가 맞지 않으면 강제로 (512,512,3)으로 변환
-        if avg_hed_resized.shape[:2] != (512,512) or avg_hed_resized.shape[2] != 3:
-            avg_hed_resized = np.array(
-                Image.fromarray(np.uint8(avg_hed_resized)).convert("RGB").resize((512,512))
-            ).astype(float)
-        # 원본 스케치도 0~1 사이 값으로 변환 (여기서는 사용되지 않지만, 필요시 대비)
-        curr_sketch_arr = np.array(curr_sketch_np).astype(float) / 255.
-        # 아래 계산식은 원본 스케치를 무시하고 avg_hed를 기반으로 결과를 생성함 (필요에 따라 조정)
-        curr_sketch_final = Image.fromarray(
-            np.uint8( (1.0 - (avg_hed_resized / 255.)) * 255. )
-        )
-    else:
-        curr_sketch_final = None
+def select_image_and_update_tab_with_prompts(image, prompt, negative_prompt):
+    selected = select_image(image)
+    return selected, prompt, negative_prompt, gr.update(selected=2)
 
-    return to_return + [curr_sketch_final, prev_sketch, sketch_states]
-    
-def reset(sketch_states):
-    """스케치 상태 초기화"""
-    for k in range(num_images):
-        sketch_states[k] = [None, None]
-    return None, None, sketch_states
-
-######################################
-# UI 구성 (Gradio 5.x)
-######################################
-
+# --- UI 구성 ---
 with gr.Blocks() as demo:
-    # 초기 상태 설정
-    initial_sketch_state = [[None, None] for _ in range(num_images)]
-    sketch_states = gr.State(initial_sketch_state)
-    checkbox_state = gr.State(True)
-    
+    version_state = gr.State([])
+
+    start_state = [[None, None] for _ in range(num_images)]
+    sketch_states = gr.State(start_state)
+    white_brush = gr.Brush(default_color='#FFFFFF', colors=['#FFFFFF'], color_mode='fixed')
+
     with gr.Row():
         with gr.Column(scale=1):
-            # Tabs 사용: Sketch (입력)와 Suggested Lines (결과 미리보기)
             with gr.Tabs():
-                with gr.TabItem("Sketch"):
-                    i = gr.ImageEditor(
-                        type="numpy",
-                        height=600,
-                        width=600
-                    )
-                with gr.TabItem("Suggested Lines"):
-                    i_sketch = gr.Image(
-                        height=600,
-                        width=600
-                    )
-            prompt_box = gr.Textbox(label="Prompt")
-            with gr.Row():
-                btn = gr.Button("Render")
-                checkbox = gr.Checkbox(label="Generated suggested lines", value=True)
-                btn2 = gr.Button("Reset")
-            i_prev = gr.Image(height=768, width=768)
-        with gr.Column(scale=1):
-            o_list = [gr.Image(height=512, width=512) for _ in range(num_images)]
+                with gr.TabItem("Main"):
+                    with gr.Tabs() as sub_tabs:
+                        with gr.TabItem("Sketch", id=0):
+                            with gr.Row(scale=2):
+                                with gr.Column(scale=1):
+                                    i = gr.Sketchpad(brush=gr.Brush(default_size=3), canvas_size=(1024,1024))
+                                    sketch_prompt = gr.Textbox(label="Prompt")
+                                    skectch_negative_prompt = gr.Textbox(label="Negative Prompt")
+                                    checkbox_for_suggested_lines = gr.Checkbox(label="Generated suggested lines", value=True)
+                                    # 초기값 False로 설정하여, 체크하지 않을 때 False, 체크하면 True 전달됨
+                                    checkbox_remove_background = gr.Checkbox(label="Remove Background", value=False)
+
+                                    with gr.Row():
+                                        btn = gr.Button("Render")
+                                        btn2 = gr.Button("Reset")
+                                    i_prev = gr.Image(label="Composite Preview", interactive=False)
+                                with gr.Column(scale=1):
+                                    out_imgs = []
+                                    select_btns = []
+                                    for r in range(3):  # 3행
+                                        with gr.Row():
+                                            for c in range(2):  # 2열
+                                                idx = r * 2 + c
+                                                if idx < num_images:
+                                                    with gr.Column():
+                                                        out_img = gr.Image(label=f"Generated Image {idx+1}", interactive=False)
+                                                        select_btn = gr.Button("Select", variant="secondary")
+                                                    out_imgs.append(out_img)
+                                                    select_btns.append(select_btn)
+                        with gr.TabItem("Suggested Lines", visible=False):
+                            i_sketch = gr.Image()
+                        with gr.TabItem("Image-to-Image", id=1):
+                            with gr.Row(scale=2):
+                                with gr.Column():
+                                    selected_image_display = gr.Image(label="Selected Image")
+                                    img2img_prompt = gr.Textbox(label="Image-to-Image Prompt")
+                                    img2img_negative_prompt = gr.Textbox(label="Negative Prompt")
+                                    checkbox_remove_background_for_img2img = gr.Checkbox(label="Remove Background", value=False)
+                                    img2img_strength = gr.Slider(minimum=0, maximum=1, value=0.75, label="Strength")
+                                    img2img_guidance = gr.Slider(minimum=1, maximum=10, value=7.5, label="Guidance Scale")
+                                    img2img_btn = gr.Button("Generate Image-to-Image")
+                                with gr.Column():
+                                    img2img_output = gr.Image(type='pil', label="Image-to-Image Result")
+                                    img2img_select_btn = gr.Button("Select for Inpainting", variant="secondary")
+                        with gr.TabItem("Inpaint-to-Image", id=2):
+                            with gr.Row(scale=2):
+                                with gr.Column():
+                                    inpaint2img = gr.ImageEditor(label='Inpaint', interactive=True, canvas_size=(1024,1024))
+                                    inpaint2img_prompt = gr.Textbox(label='prompt')
+                                    inpaint2img_negative_prompt = gr.Textbox(label='negative prompt')
+                                    checkbox_remove_background_for_inpaint2img = gr.Checkbox(label="Remove Background", value=False)
+                                    inpaint2img_strength = gr.Slider(minimum=0, maximum=1, value=1.0, label="Strength")
+                                    inpaint2img_guidance = gr.Slider(minimum=1, maximum=10, value=7.5, label="Guidance Scale")
+                                    inpaint2img_btn = gr.Button("Generate Inpainting")
+                                with gr.Column():
+                                    inpaint2img_outputs = gr.Image(type="pil", interactive=False)
+                                    inpaint2img_retry_btn = gr.Button("Retry to Inpaint", variant="secondary")
+                                    # inpaint2img_retry_for_image_to_image_btn = gr.Button("Retry to Image-to-Image", variant="secondary")
+                with gr.TabItem("Version"):
+                    version_gallery = gr.Gallery(label="Version History", columns=[5], object_fit="contain", height="auto")
+
+    # --- 이벤트/콜백 연결 ---
+    i.change(predict, inputs=i, outputs=i_prev, show_progress="hidden")
     
-    # 이벤트 연결
     btn.click(
-        fn=run_sketching,
-        inputs=[prompt_box, i, i_prev, sketch_states, checkbox_state],
-        outputs=o_list + [i_sketch, i_prev, sketch_states]
+        run_sketching_with_version, 
+        inputs=[sketch_prompt, skectch_negative_prompt, i_prev, sketch_states, checkbox_for_suggested_lines, checkbox_remove_background, version_state], 
+        outputs=out_imgs + [i_sketch, i_prev, sketch_states, version_state]
     )
     
-    btn2.click(
-        fn=reset,
-        inputs=sketch_states,
-        outputs=[i, i_prev, sketch_states]
+    for out_img, select_btn in zip(out_imgs, select_btns):
+        select_btn.click(
+            select_image_and_record_switch_with_prompts,
+            inputs=[out_img, version_state, sketch_prompt, skectch_negative_prompt],
+            outputs=[selected_image_display, version_state, img2img_prompt, img2img_negative_prompt, sub_tabs]
+        )
+    
+    img2img_btn.click(
+        generate_img2img_with_version,
+        inputs=[selected_image_display, img2img_prompt, img2img_strength, img2img_guidance, img2img_negative_prompt, version_state, checkbox_remove_background_for_img2img],
+        outputs=[img2img_output, version_state]
     )
     
-    checkbox.change(
-        fn=lambda x: x,
-        inputs=[checkbox],
-        outputs=[checkbox_state]
+    img2img_select_btn.click(
+        select_image_and_update_tab_with_prompts,
+        inputs=[img2img_output, img2img_prompt, img2img_negative_prompt],
+        outputs=[inpaint2img, inpaint2img_prompt, inpaint2img_negative_prompt, sub_tabs]
     )
+    inpaint2img_retry_btn.click(
+        select_image,
+        inputs=inpaint2img_outputs,
+        outputs=inpaint2img
+    )
+
+    inpaint2img_btn.click(
+        generate_inpainted_image_with_version,
+        inputs=[inpaint2img, inpaint2img_prompt, inpaint2img_negative_prompt, inpaint2img_strength, inpaint2img_guidance, version_state, checkbox_remove_background_for_inpaint2img,], 
+        outputs=[inpaint2img_outputs, version_state]
+    )
+    
+    btn2.click(reset, inputs=sketch_states, outputs=[i, i_prev, sketch_states])
+    
+    version_state.change(lambda x: x, inputs=[version_state], outputs=[version_gallery])
 
 demo.launch(share=True)
