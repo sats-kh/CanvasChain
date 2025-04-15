@@ -15,8 +15,18 @@ from controlnet_aux import HEDdetector
 from accelerate import Accelerator
 from rembg import remove
 
+# 번역 모델 관련 임포트
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from langdetect import detect
+
 # 모델 설정 딕셔너리 (확장 가능)
 MODEL_CONFIGS = {
+    "Disney-Diffusion": {
+        "sd_model": "nitrosocke/classic-anim-diffusion",
+        "controlnet_model": "vsanimator/sketch-a-sketch",
+        "scheduler": EulerAncestralDiscreteScheduler,
+        "type": "controlnet"
+    },
     "Ghibli-Diffusion": {
         "sd_model": "nitrosocke/Ghibli-Diffusion",
         "controlnet_model": "vsanimator/sketch-a-sketch",
@@ -36,6 +46,29 @@ MODEL_CONFIGS = {
 # Accelerator 인스턴스 생성
 accelerator = Accelerator()
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# 번역 모델 로드 (GPU 1에 로드)
+model_name = "NHNDQ/nllb-finetuned-ko2en"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+translation_model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to("cuda:0")
+
+def translate_korean_to_english(korean_text):
+    inputs = tokenizer(korean_text, return_tensors="pt", padding=True, truncation=True).to("cuda:0")
+    outputs = translation_model.generate(**inputs, max_length=512)
+    translated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return translated_text
+
+def process_prompt(prompt):
+    try:
+        detected_language = detect(prompt)
+        print(detected_language)
+        if detected_language == "ko":
+            prompt = translate_korean_to_english(prompt)
+            print(prompt)
+    except Exception as e:
+        # 언어 감지에 실패하면 원본 프롬프트를 그대로 사용
+        pass
+    return prompt
 
 class ModelManager:
     def __init__(self, default_model="Ghibli-Diffusion"):
@@ -86,7 +119,6 @@ class ModelManager:
     def get_current_pipe(self):
         return self.models[self.current_model]
 
-
 # ModelManager 인스턴스 생성 (기본 모델은 "Ghibli-Diffusion")
 model_manager = ModelManager(default_model="Ghibli-Diffusion")
 
@@ -95,7 +127,6 @@ negative_prompt = ""
 num_images = 6
 
 def remove_bg(im):
-    
     removed_bg = remove(im)
     # RGBA로 변환
     removed_bg = removed_bg.convert("RGBA")
@@ -118,9 +149,15 @@ def predict(im):
     return np.array(final_img)
 
 # 스케치 함수: 현재 컨트롤넷 파이프라인을 사용하여 이미지 생성
-def sketch(composite, prompt, negative_prompt, remove_background, seed, num_steps):
-    print("Sketching")
-    pipe = model_manager.load_model("Ghibli-Diffusion")
+def sketch(selected_model, composite, prompt, negative_prompt, remove_background, seed, num_steps):
+    # 프롬프트가 한글이면 영어로 번역
+    prompt = process_prompt(prompt)
+    negative_prompt = process_prompt(negative_prompt)
+    
+    if selected_model == "Disney-Diffusion":
+        pipe = model_manager.load_model("Disney-Diffusion")
+    else:
+        pipe = model_manager.load_model("Ghibli-Diffusion")
 
     if composite is None:
         composite = np.full((512, 512, 3), 255, dtype=np.uint8)
@@ -141,15 +178,15 @@ def sketch(composite, prompt, negative_prompt, remove_background, seed, num_step
         return remove_bg(images[0])   
     return images[0]
 
-def run_sketching(prompt, negative_prompt, composite, sketch_states, shadow_draw, remove_background,):
+def run_sketching(selected_model, prompt, negative_prompt, composite, sketch_states, shadow_draw, remove_background):
     to_return = []
     curr_sketch = composite
     for k in range(num_images):
         seed = sketch_states[k][1]
         if seed is None:
-            seed = np.random.randint(1000)
+            seed = np.random.randint(100000)
             sketch_states[k][1] = seed
-        new_image = sketch(curr_sketch, prompt, negative_prompt, remove_background, seed=seed, num_steps=20)
+        new_image = sketch(selected_model, curr_sketch, prompt, negative_prompt, remove_background, seed=seed, num_steps=35)
         to_return.append(new_image)
     if shadow_draw:
         hed = model_manager.hed
@@ -163,6 +200,9 @@ def run_sketching(prompt, negative_prompt, composite, sketch_states, shadow_draw
 def generate_img2img(selected_img, img2img_prompt, img2img_strength, img2img_guidance, img2img_negative_prompt, remove_background):
     if selected_img is None:
         return None
+    # 프롬프트가 한글이면 영어로 번역
+    img2img_prompt = process_prompt(img2img_prompt)
+    img2img_negative_prompt = process_prompt(img2img_negative_prompt)
     init_image = Image.fromarray(selected_img.astype('uint8')).resize((1024,1024))
     model_manager.load_model("Stable-Diffusion-3.5-Large")
     pipe = model_manager.get_current_pipe()
@@ -181,6 +221,9 @@ def generate_img2img(selected_img, img2img_prompt, img2img_strength, img2img_gui
 def generate_inpainted_image(inpaint_data, prompt, negative_prompt, strength, guidance_scale, remove_background):
     if inpaint_data is None or "background" not in inpaint_data or len(inpaint_data.get("layers", [])) == 0:
         return None
+    # 프롬프트가 한글이면 영어로 번역
+    prompt = process_prompt(prompt)
+    negative_prompt = process_prompt(negative_prompt)
     bg = Image.fromarray(inpaint_data["background"]).convert("RGB")
     mask_layer = Image.fromarray(inpaint_data["layers"][0].astype('uint8')).resize(bg.size)
     mask_layer = mask_layer.convert("RGBA")
